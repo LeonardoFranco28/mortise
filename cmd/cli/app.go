@@ -98,15 +98,15 @@ func newAppCreateCmd() *cobra.Command {
 	cmd.Flags().StringVar(&source, "source", "image", "Source type (git|image)")
 	cmd.Flags().StringVar(&image, "image", "", "Container image reference (for source=image)")
 	cmd.Flags().StringVar(&name, "name", "", "App name")
-	cmd.Flags().StringArrayVar(&storage, "storage", nil, "Persistent volume as name:mountPath[:size[:storageClass]] (repeatable)")
+	cmd.Flags().StringArrayVar(&storage, "storage", nil, "Persistent volume as name:mountPath:size[:storageClass] (repeatable)")
 	_ = cmd.MarkFlagRequired("name")
 	return cmd
 }
 
 func parseStorageFlag(s string) (mortisev1alpha1.VolumeSpec, error) {
 	parts := strings.Split(s, ":")
-	if len(parts) < 2 || len(parts) > 4 {
-		return mortisev1alpha1.VolumeSpec{}, fmt.Errorf("invalid --storage %q: want name:mountPath[:size[:storageClass]]", s)
+	if len(parts) < 3 || len(parts) > 4 {
+		return mortisev1alpha1.VolumeSpec{}, fmt.Errorf("invalid --storage %q: want name:mountPath:size[:storageClass] (size is required)", s)
 	}
 	v := mortisev1alpha1.VolumeSpec{Name: parts[0], MountPath: parts[1]}
 	if v.Name == "" {
@@ -115,13 +115,11 @@ func parseStorageFlag(s string) (mortisev1alpha1.VolumeSpec, error) {
 	if !strings.HasPrefix(v.MountPath, "/") {
 		return v, fmt.Errorf("invalid --storage %q: mountPath must be an absolute path", s)
 	}
-	if len(parts) > 2 && parts[2] != "" {
-		q, err := resource.ParseQuantity(parts[2])
-		if err != nil {
-			return v, fmt.Errorf("invalid --storage %q: bad size %q: %w", s, parts[2], err)
-		}
-		v.Size = q
+	q, err := resource.ParseQuantity(parts[2])
+	if err != nil {
+		return v, fmt.Errorf("invalid --storage %q: bad size %q: %w", s, parts[2], err)
 	}
+	v.Size = q
 	if len(parts) == 4 {
 		v.StorageClass = parts[3]
 	}

@@ -333,7 +333,8 @@ func TestParseStorageFlag(t *testing.T) {
 		want    mortisev1alpha1.VolumeSpec
 		wantErr bool
 	}{
-		{in: "data:/var/lib/data", want: mortisev1alpha1.VolumeSpec{Name: "data", MountPath: "/var/lib/data"}},
+		{in: "data:/var/lib/data", wantErr: true},
+		{in: "data:/var/lib/data:", wantErr: true},
 		{in: "data:/var/lib/data:10Gi", want: mortisev1alpha1.VolumeSpec{Name: "data", MountPath: "/var/lib/data", Size: resource.MustParse("10Gi")}},
 		{in: "backups:/backups:5Gi:fast", want: mortisev1alpha1.VolumeSpec{Name: "backups", MountPath: "/backups", Size: resource.MustParse("5Gi"), StorageClass: "fast"}},
 		{in: "data", wantErr: true},
