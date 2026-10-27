@@ -461,12 +461,15 @@ sys.exit(0 if diffs and all(allowed.match(d) for d in diffs) else 1)
             if $git_ok; then
                 kubectl annotate app upg-git -n pj-upg \
                     mortise.dev/rebuild-requested-at="$(date -u +%Y-%m-%dT%H:%M:%SZ)" --overwrite >/dev/null || true
+                # Do not fail on the first ImagePullBackOff sample: the
+                # upgrade rolls the registry and its proxy, and a pull that
+                # lands in that window backs off for minutes before kubelet
+                # retries (run 16 flaked exactly this way). The incident's
+                # signature is a PERSISTENT unpullable ref, so ride out the
+                # whole budget: recovery to Ready passes, persistence fails
+                # into the diagnostics below.
                 rebuild_ok=false
-                for _ in $(seq 1 60); do
-                    pull_errors=$(kubectl get pods -n pj-upg-production -o jsonpath='{range .items[*]}{.status.containerStatuses[0].state.waiting.reason}{"\n"}{end}' 2>/dev/null | grep -cE "ImagePullBackOff|ErrImagePull" || true)
-                    if [ "${pull_errors:-0}" -gt 0 ]; then
-                        break
-                    fi
+                for _ in $(seq 1 90); do
                     gphase=$(kubectl get app upg-git -n pj-upg -o jsonpath='{.status.phase}' 2>/dev/null || true)
                     gready=$(kubectl get deploy upg-git -n pj-upg-production -o jsonpath='{.status.readyReplicas}' 2>/dev/null || true)
                     if [ "$gphase" = "Ready" ] && [ "${gready:-0}" = "1" ]; then
@@ -479,6 +482,27 @@ sys.exit(0 if diffs and all(allowed.match(d) for d in diffs) else 1)
                     pass "Upgrade lane — post-upgrade rebuild of the git app produced a pullable image (CAI-1141)"
                 else
                     fail "Upgrade lane — post-upgrade git rebuild broken: phase $(kubectl get app upg-git -n pj-upg -o jsonpath='{.status.phase}' 2>/dev/null || echo none), pods: $(kubectl get pods -n pj-upg-production --no-headers 2>/dev/null | tr '\n' ';' || true) (CAI-1141 class)"
+                    # The failure line alone cannot say WHICH ref the kubelet
+                    # choked on or whether the registry holds it; capture both.
+                    info "  --- upg-git pod image refs ---"
+                    kubectl get pods -n pj-upg-production -l app.kubernetes.io/name=upg-git \
+                        -o jsonpath='{range .items[*]}{.metadata.name} image={.spec.containers[0].image} waiting={.status.containerStatuses[0].state.waiting.reason}{"\n"}{end}' 2>&1 || true
+                    info "  --- upg-git ReplicaSets ---"
+                    kubectl get rs -n pj-upg-production -l app.kubernetes.io/name=upg-git \
+                        -o jsonpath='{range .items[*]}{.metadata.name} created={.metadata.creationTimestamp} replicas={.status.replicas} image={.spec.template.spec.containers[0].image}{"\n"}{end}' 2>&1 || true
+                    info "  --- pull events ---"
+                    kubectl get events -n pj-upg-production --field-selector reason=Failed \
+                        -o jsonpath='{range .items[*]}{.lastTimestamp} {.involvedObject.name}: {.message}{"\n"}{end}' 2>&1 | tail -10 || true
+                    info "  --- upg-git App status ---"
+                    kubectl get app upg-git -n pj-upg -o jsonpath='{.status}' 2>&1 | head -c 2000 || true; echo
+                    info "  --- registry tags for the upg project ---"
+                    kubectl port-forward -n "$DEPS_NAMESPACE" svc/registry 15001:5000 >/dev/null 2>&1 &
+                    REG_PF=$!
+                    sleep 3
+                    for repo in $(curl -fsS http://localhost:15001/v2/_catalog 2>/dev/null | python3 -c 'import json,sys; print(" ".join(json.load(sys.stdin)["repositories"]))' 2>/dev/null); do
+                        case "$repo" in *upg*) echo "  $repo: $(curl -fsS "http://localhost:15001/v2/${repo}/tags/list" 2>/dev/null)";; esac
+                    done
+                    kill "$REG_PF" 2>/dev/null || true
                 fi
             fi
         fi
