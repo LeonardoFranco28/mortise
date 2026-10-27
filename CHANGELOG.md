@@ -9,6 +9,13 @@ Mortise uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **A Project with no members says so** (CAI-944): git-source builds use
+  membership-based git auth, so a freshly created Project builds nothing
+  until a ProjectMember exists — but the only symptom was a per-App
+  `GitAuthFailed`. The Project now carries a `MembersReady` condition:
+  `False/NoMembers` (naming the consequence) while the control namespace has
+  no ProjectMember, `True` once one exists, updated immediately on member
+  add/remove.
 - **A PVC stranded by a volume removal is now a condition** (CAI-506):
   removing a volume from an App's spec leaves its PVC in place (data is
   never deleted implicitly), but nothing said so — the volume simply
@@ -74,6 +81,84 @@ Mortise uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Tag resolution can no longer mint unpullable image digests** (CAI-1141):
+  the registry backend's manifests HEAD sent no Accept header, so a registry
+  holding an OCI index could answer with a legacy conversion whose
+  `Docker-Content-Digest` names content that exists only as that response — a
+  pull or delete by that digest then fails with manifest-unknown while the tag
+  keeps resolving. The interrupted-build adoption probe pinned production
+  Deployments to exactly such refs during an upgrade (fleet-wide
+  ImagePullBackOff). Every manifests HEAD now declares the full set of
+  pullable manifest media types, so a resolved digest is always a stored one.
+- **The controller no longer wipes annotations it didn't set** (#631): every
+  reconciled resource (Deployment, CronJob, Service, Ingress, PVC,
+  ExternalName Service) had its annotation map replaced wholesale, removing
+  keys owned by other controllers. On a PVC this deleted
+  `pv.kubernetes.io/bind-completed`, which the PV controller immediately
+  restored, so the two fought at ~40 writes/s forever. Mortise now manages
+  only its own annotation keys (tracked via a `mortise.dev/managed-annotations`
+  bookkeeping entry), leaves foreign keys alone, and skips the write entirely
+  when nothing it manages changed — a bound PVC is never written again.
+  Thanks to IIRoan for the report, diagnosis, and measurement.
+- **Integration builds no longer cold-pull base images from docker.io**
+  (CAI-461): the suite's BuildKit now resolves `docker.io` through the
+  in-cluster test registry, which the setup seeds with the fixtures' base
+  images (`alpine:3.20`, `node:22-alpine`) from the host's pre-pulled,
+  retry-guarded copies — removing the cold pull that intermittently blew the
+  build-heavy tests' ready budget on slow CI runners. A mirror miss falls
+  back to docker.io.
+- **Saving env vars no longer fails over an unchanged binding var** (#560):
+  a client that round-trips the full variable set — the pre-1.1.0 UI did on
+  every save, and any GET-then-PUT script still does — echoed binding-managed
+  vars back unchanged and the whole save was rejected with "cannot overwrite
+  ... managed by binding", even when only a new user var was being added.
+  An incoming managed var whose value matches the current one is now a no-op;
+  an actual value change still conflicts.
+- **A missed push webhook no longer strands a git app on a stale revision**
+  (CAI-1134): the push webhook was the only writer of the revision an app
+  builds, so one dropped delivery (observed in production: GitHub generated
+  no push event for a squash merge) left the app serving the old commit
+  indefinitely while reporting Ready — and a manual rebuild faithfully
+  rebuilt the stale revision. On the hourly verify cadence the operator now
+  re-resolves the branch head and, when the annotation is behind, re-stamps
+  it exactly as the webhook would have, so a missed push repairs within the
+  hour.
+- **Webhooks are verified while an app is idle, and a deficient hook is
+  rejected** (CAI-793): webhook verification only ran while a build was
+  pending, so `WebhookConfigured` latched stale on idle apps — a webhook
+  secret arriving after the last build left `False` standing for days, and
+  a lost hook on an idle app went unnoticed until the push it never
+  delivered. Builds-current reconciles now run the webhook pass on the
+  verify cadence, degrading failures to the condition (not the App phase).
+  The URL-match scan also checks the hook's event set, so a hand-registered
+  push-only hook no longer passes while PR previews silently hear nothing.
+- **An env var that never resolves now fails the App instead of vanishing**
+  (CAI-943): a spec env entry whose `valueFrom.secretRef` named a Secret
+  missing the key (or any other unresolvable source) was logged and skipped —
+  the variable was silently absent from the pod while the App reported
+  `Ready`. It now sets phase `Failed` with an `EnvVarInvalid` condition
+  naming the variable. A ref that resolved before and then broke keeps
+  serving its last value and stays reported via
+  `status.environments[].unresolvedEnvKeys`, unchanged.
+- **A pod can no longer start silently unconfigured** (CAI-1003): the
+  generated `envFrom` named the derived `{app}-env` Secret with
+  `optional: true` while the controller skipped creating it when no vars
+  resolved — so an app whose configuration failed to materialize started
+  anyway, reported Ready, and nothing said the keys it asked for were
+  absent (five production pods ran this way). The derived Secrets are now
+  always created, empty included, and the `envFrom` references are
+  required: an absent Secret blocks the container loudly and the
+  controller recreates it on the next reconcile.
+- **A member arriving after the App now unlatches `GitAuthFailed`** (CAI-960):
+  the App controller had no ProjectMember watch, so an App that reconciled
+  before the project's first member latched `GitAuthFailed` and a valid token
+  added afterwards went unread until an unrelated touch or the cache resync.
+  A ProjectMember event now re-reconciles the project's git-source Apps, so
+  the App recovers on its own the moment the member exists.
+- **The app drawer's tab strip scrolls at narrow viewports** (CAI-570): at
+  ~540px the tab row overflowed with no horizontal scroll, leaving the later
+  tabs unreachable. The strip now scrolls without clipping the active tab's
+  border, and tabs no longer shrink or wrap.
 - **Rollback and promote now change the running image** (CAI-498, CAI-511):
   both patched the controller-owned Deployment directly, which the next
   reconcile reverted to the App's spec/built image — the API returned `200`

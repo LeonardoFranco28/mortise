@@ -128,6 +128,16 @@ const namespaceCreationBudget = 2 * time.Minute
 // logs.
 const appResourceConflictCondition = "ResourceConflict"
 
+// appEnvVarInvalidCondition is set when a spec env var cannot be resolved —
+// a secretRef Secret that is missing or lacks the key, a fromBinding ref not
+// in the bindings list, or more than one source set — and has no previously
+// resolved value to keep serving. The CRD contract (api/v1alpha1
+// EnvVarSource) says these are errors; silently skipping the var shipped a
+// pod without it while the App reported Ready (CAI-943). A reference that
+// resolved before and then broke is the other case: it keeps serving and is
+// reported in status.environments[].unresolvedEnvKeys instead.
+const appEnvVarInvalidCondition = "EnvVarInvalid"
+
 // AppReconciler reconciles a App object
 type AppReconciler struct {
 	client.Client
@@ -169,6 +179,7 @@ const (
 	webhookRegisteredReason     = "Registered"
 	webhookMissingURLReason     = "WebhookURLUnavailable"
 	webhookMissingSecretReason  = "WebhookSecretUnavailable"
+	webhookMissingTokenReason   = "WebhookTokenUnavailable"
 	webhookInputHashMessageKey  = "inputHash="
 	webhookVerifiedAtMessageKey = "verifiedAt="
 	// How long WebhookConfigured=True is trusted before the hook's existence
@@ -298,6 +309,14 @@ func (r *AppReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 			if !proceed {
 				return result, nil
 			}
+		} else if r.BuildClient != nil && webhookVerificationDue(&app, r.clock().Now()) {
+			// Builds all current means prepareGitSource — the usual home of
+			// ensureWebhook — is skipped, which left WebhookConfigured latched
+			// stale: a webhook Secret created after the last build never
+			// flipped a False condition, and the CAI-343 re-verify never ran
+			// for an idle app, exactly the one whose lost hook nobody notices
+			// (CAI-793).
+			r.ensureWebhookSteady(ctx, &app)
 		}
 	case mortisev1alpha1.SourceTypeImage:
 		// Best-effort port detection from the image's registry config
@@ -550,11 +569,23 @@ func (r *AppReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 		}
 		resourceConflictCleared = true
 	}
+	// Same for a stale EnvVarInvalid condition: every spec env var resolved
+	// this pass.
+	envVarInvalidCleared := false
+	if meta.FindStatusCondition(app.Status.Conditions, appEnvVarInvalidCondition) != nil {
+		if err := r.updateAppStatus(ctx, &app, func(status *mortisev1alpha1.AppStatus) {
+			meta.RemoveStatusCondition(&status.Conditions, appEnvVarInvalidCondition)
+		}); err != nil {
+			return ctrl.Result{}, fmt.Errorf("clear env var invalid condition: %w", err)
+		}
+		envVarInvalidCleared = true
+	}
 
 	if !needsRequeue && (app.Status.Phase != mortisev1alpha1.AppPhaseFailed ||
 		domainCollisionCleared ||
 		rbacForbiddenCleared ||
 		resourceConflictCleared ||
+		envVarInvalidCleared ||
 		shouldRefreshFailedAppStatus(&app, resolvedEnvs, previewEnvNames)) {
 		if err := r.updateStatus(ctx, &app, resolvedEnvs, previewEnvNames); err != nil {
 			return ctrl.Result{}, fmt.Errorf("update status: %w", err)
@@ -573,7 +604,38 @@ func (r *AppReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 		return ctrl.Result{RequeueAfter: healthRequeueAfter(&app, r.clock())}, nil
 	}
 
+	// Git-source apps revisit on the webhook verify cadence: nothing else
+	// requeues a Ready app, so without this the CAI-343 re-verify only ever
+	// fired while builds were pending (CAI-793).
+	if app.Spec.Source.Type == mortisev1alpha1.SourceTypeGit && r.BuildClient != nil {
+		return ctrl.Result{RequeueAfter: webhookRequeueAfter(&app, r.clock().Now())}, nil
+	}
+
 	return ctrl.Result{}, nil
+}
+
+// webhookRequeueAfter returns the time until the webhook condition next needs
+// attention: the remainder of the verify interval for a fresh True condition,
+// the full interval otherwise (a False condition retries on that cadence; its
+// permanent-failure latch makes the retry a no-op until an input changes).
+func webhookRequeueAfter(app *mortisev1alpha1.App, now time.Time) time.Duration {
+	cond := meta.FindStatusCondition(app.Status.Conditions, webhookConditionType)
+	if cond == nil || cond.Status != metav1.ConditionTrue {
+		return webhookVerifyInterval
+	}
+	for _, line := range strings.Split(cond.Message, "\n") {
+		if strings.HasPrefix(line, webhookVerifiedAtMessageKey) {
+			t, err := time.Parse(time.RFC3339, strings.TrimPrefix(line, webhookVerifiedAtMessageKey))
+			if err != nil {
+				break
+			}
+			if d := t.Add(webhookVerifyInterval).Sub(now); d > time.Minute {
+				return d
+			}
+			return time.Minute
+		}
+	}
+	return webhookVerifyInterval
 }
 
 // envResourceError converts a failure from a per-env resource reconcile into
@@ -602,6 +664,22 @@ func (r *AppReconciler) envResourceError(ctx context.Context, app *mortisev1alph
 			})
 		}); updateErr != nil {
 			logf.FromContext(ctx).Error(updateErr, "update status after resource conflict", "namespace", envNs)
+		}
+		return ctrl.Result{}, wrapped
+	}
+	var envVarErr *envVarResolutionError
+	if stderrors.As(err, &envVarErr) {
+		if updateErr := r.updateAppStatus(ctx, app, func(status *mortisev1alpha1.AppStatus) {
+			status.Phase = mortisev1alpha1.AppPhaseFailed
+			meta.SetStatusCondition(&status.Conditions, metav1.Condition{
+				Type:               appEnvVarInvalidCondition,
+				Status:             metav1.ConditionTrue,
+				Reason:             "InvalidValueFrom",
+				Message:            wrapped.Error(),
+				ObservedGeneration: app.Generation,
+			})
+		}); updateErr != nil {
+			logf.FromContext(ctx).Error(updateErr, "update status after env var resolution failure", "namespace", envNs)
 		}
 		return ctrl.Result{}, wrapped
 	}
@@ -1878,7 +1956,7 @@ func (r *AppReconciler) reconcileDeployment(ctx context.Context, app *mortisev1a
 			Name:        name,
 			Namespace:   envNs,
 			Labels:      appLabels(app, env.Name),
-			Annotations: userAnno,
+			Annotations: stampManagedAnnotations(userAnno),
 		},
 		Spec: appsv1.DeploymentSpec{
 			Replicas: &replicas,
@@ -1941,12 +2019,10 @@ func (r *AppReconciler) reconcileDeployment(ctx context.Context, app *mortisev1a
 		if err := conflictIfUnmanaged(existing, "Deployment"); err != nil {
 			return false, err
 		}
-		desiredAnnotations := mergeAnnotations(nil, desired.Annotations)
-		for k, v := range existing.Annotations {
-			if strings.HasPrefix(k, "deployment.kubernetes.io/") {
-				desiredAnnotations = mergeAnnotations(desiredAnnotations, map[string]string{k: v})
-			}
-		}
+		// Only our own annotation keys: mergeManagedAnnotations keeps every
+		// foreign key (deployment.kubernetes.io/revision among them) without
+		// the per-prefix carve-out this block used to hand-maintain.
+		desiredAnnotations, annotationsChanged := mergeManagedAnnotations(existing.Annotations, desired.Annotations)
 
 		// Re-derive desired annotations from the (possibly re-fetched) existing
 		// Deployment so stale values from a prior iteration don't persist.
@@ -2017,7 +2093,7 @@ func (r *AppReconciler) reconcileDeployment(ctx context.Context, app *mortisev1a
 		if existing.Spec.ProgressDeadlineSeconds == nil || *existing.Spec.ProgressDeadlineSeconds != *desired.Spec.ProgressDeadlineSeconds {
 			needsUpdate = true
 		}
-		if !annotationsEqual(existing.Annotations, desiredAnnotations) {
+		if annotationsChanged {
 			needsUpdate = true
 		}
 		if !equality.Semantic.DeepEqual(existing.Spec.Template.ObjectMeta.Labels, desired.Spec.Template.ObjectMeta.Labels) {
@@ -2138,7 +2214,7 @@ func (r *AppReconciler) reconcileCronJob(ctx context.Context, app *mortisev1alph
 			Name:        name,
 			Namespace:   envNs,
 			Labels:      appLabels(app, env.Name),
-			Annotations: userAnno,
+			Annotations: stampManagedAnnotations(userAnno),
 		},
 		Spec: batchv1.CronJobSpec{
 			Schedule:          env.Schedule,
@@ -2241,7 +2317,8 @@ func (r *AppReconciler) reconcileCronJob(ctx context.Context, app *mortisev1alph
 		if !annotationsEqual(existing.Spec.JobTemplate.Spec.Template.ObjectMeta.Annotations, desiredPodAnnotations) {
 			needsUpdate = true
 		}
-		if !annotationsEqual(existing.Annotations, desired.Annotations) {
+		mergedAnnotations, annotationsChanged := mergeManagedAnnotations(existing.Annotations, desired.Annotations)
+		if annotationsChanged {
 			needsUpdate = true
 		}
 		if !equality.Semantic.DeepEqual(existing.Spec.JobTemplate.Spec.Template.ObjectMeta.Labels, desired.Spec.JobTemplate.Spec.Template.ObjectMeta.Labels) {
@@ -2260,7 +2337,7 @@ func (r *AppReconciler) reconcileCronJob(ctx context.Context, app *mortisev1alph
 			return false, nil
 		}
 
-		existing.Annotations = desired.Annotations
+		existing.Annotations = mergedAnnotations
 		existing.Spec.Schedule = desired.Spec.Schedule
 		existing.Spec.ConcurrencyPolicy = desired.Spec.ConcurrencyPolicy
 		existing.Spec.JobTemplate.Spec.Template.ObjectMeta.Annotations = desiredPodAnnotations
@@ -2285,7 +2362,7 @@ func (r *AppReconciler) reconcileService(ctx context.Context, app *mortisev1alph
 			Name:        name,
 			Namespace:   envNs,
 			Labels:      appLabels(app, env.Name),
-			Annotations: mergeAnnotations(nil, env.Annotations),
+			Annotations: stampManagedAnnotations(mergeAnnotations(nil, env.Annotations)),
 		},
 		Spec: corev1.ServiceSpec{
 			Selector: appLabels(app, env.Name),
@@ -2331,8 +2408,8 @@ update:
 			return false, err
 		}
 		changed := false
-		if !equality.Semantic.DeepEqual(existing.Annotations, desired.Annotations) {
-			existing.Annotations = desired.Annotations
+		if merged, ch := mergeManagedAnnotations(existing.Annotations, desired.Annotations); ch {
+			existing.Annotations = merged
 			changed = true
 		}
 		if !equality.Semantic.DeepEqual(existing.Labels, desired.Labels) {
@@ -2420,7 +2497,7 @@ func (r *AppReconciler) reconcileIngress(ctx context.Context, app *mortisev1alph
 			Name:        name,
 			Namespace:   envNs,
 			Labels:      appLabels(app, env.Name),
-			Annotations: mergeAnnotations(owned, env.Annotations),
+			Annotations: stampManagedAnnotations(mergeAnnotations(owned, env.Annotations)),
 		},
 		Spec: networkingv1.IngressSpec{
 			Rules: rules,
@@ -2465,8 +2542,8 @@ func (r *AppReconciler) reconcileIngress(ctx context.Context, app *mortisev1alph
 			existing.Spec = desired.Spec
 			changed = true
 		}
-		if !equality.Semantic.DeepEqual(existing.Annotations, desired.Annotations) {
-			existing.Annotations = desired.Annotations
+		if merged, ch := mergeManagedAnnotations(existing.Annotations, desired.Annotations); ch {
+			existing.Annotations = merged
 			changed = true
 		}
 		if !equality.Semantic.DeepEqual(existing.Labels, desired.Labels) {
@@ -2716,7 +2793,7 @@ func (r *AppReconciler) reconcilePVCs(ctx context.Context, app *mortisev1alpha1.
 				Name:        name,
 				Namespace:   envNs,
 				Labels:      appLabels(app, envName),
-				Annotations: envAnno,
+				Annotations: stampManagedAnnotations(envAnno),
 			},
 			Spec: corev1.PersistentVolumeClaimSpec{
 				AccessModes: []corev1.PersistentVolumeAccessMode{accessMode},
@@ -2785,8 +2862,8 @@ func (r *AppReconciler) reconcilePVCs(ctx context.Context, app *mortisev1alpha1.
 				existing.Labels = desired.Labels
 				changed = true
 			}
-			if !annotationsEqual(existing.Annotations, desired.Annotations) {
-				existing.Annotations = desired.Annotations
+			if merged, ch := mergeManagedAnnotations(existing.Annotations, desired.Annotations); ch {
+				existing.Annotations = merged
 				changed = true
 			}
 			return changed, nil
@@ -2960,6 +3037,21 @@ func (r *AppReconciler) reconcileEnvSecret(ctx context.Context, app *mortisev1al
 		bindingRefs[b.Ref] = true
 	}
 
+	// A reference that resolved before and then broke keeps serving its last
+	// value (CAI-162 follow-up; unresolvedEnvKeysFor reports the break), so
+	// resolution failure is only an error for a var with no served value.
+	derivedKeys := map[string]struct{}{}
+	var derivedSecret corev1.Secret
+	if err := r.Get(ctx, types.NamespacedName{
+		Name: envstore.AppEnvSecretName(app.Name), Namespace: envNs,
+	}, &derivedSecret); err == nil {
+		for k := range derivedSecret.Data {
+			derivedKeys[k] = struct{}{}
+		}
+	} else if !errors.IsNotFound(err) {
+		return fmt.Errorf("read derived env secret: %w", err)
+	}
+
 	// Resolve spec env values outside the retry callback — they read other
 	// Secrets, not the app-env Secret being mutated.
 	type resolvedVar struct {
@@ -2971,8 +3063,14 @@ func (r *AppReconciler) reconcileEnvSecret(ctx context.Context, app *mortisev1al
 	for _, ev := range env.Env {
 		resolved, source, err := r.resolveEnvVarValue(ctx, ev, envNs, projectName, env.Name, bindingRefs)
 		if err != nil {
-			log.Error(err, "skipping env var with invalid valueFrom", "var", ev.Name)
-			continue
+			if _, served := derivedKeys[ev.Name]; served {
+				log.Error(err, "env var reference broke after resolving; keeping last value", "var", ev.Name)
+				continue
+			}
+			// Not a skip: the CRD contract (EnvVarSource doc) says an
+			// unresolvable var is an error. Dropping it shipped a pod without
+			// the variable while the App reported Ready (CAI-943).
+			return &envVarResolutionError{err: err}
 		}
 		resolvedSpecEnv[ev.Name] = resolved
 
@@ -3003,11 +3101,6 @@ func (r *AppReconciler) reconcileEnvSecret(ctx context.Context, app *mortisev1al
 	// Append fromBinding vars last so explicit user projections win over
 	// auto-generated binding vars when names collide.
 	bindingEnvs = append(bindingEnvs, fromBindingEnvs...)
-	if len(bindingEnvs) == 0 {
-		if _, err := r.deleteBindingOnlyEnvSecret(ctx, envNs, app.Name); err != nil {
-			return fmt.Errorf("delete empty binding-only env secret: %w", err)
-		}
-	}
 
 	// Stale-spec removal, spec seeding, and binding-source replacement all
 	// recompute from the fresh read inside the conflict-retry callback, so
@@ -3085,10 +3178,10 @@ func (r *AppReconciler) reconcileEnvSecret(ctx context.Context, app *mortisev1al
 		}
 		result = append(result, bindingEnvs...)
 
-		if len(current) == 0 && len(result) == 0 {
-			// Nothing to write — don't create an empty Secret.
-			return nil, envstore.ErrSkip
-		}
+		// An empty result still writes: the Deployment's envFrom names this
+		// Secret as REQUIRED (CAI-1003), so it must exist even when the app
+		// declares no vars. Skipping the empty create is what used to leave
+		// Ready pods naming an absent Secret with optional: true.
 		return result, nil
 	})
 	if err != nil {
@@ -3164,52 +3257,6 @@ func (r *AppReconciler) resolveEnvVarValue(
 	}
 
 	return ev.Value, "user", nil
-}
-
-func (r *AppReconciler) deleteBindingOnlyEnvSecret(ctx context.Context, envNs, appName string) (bool, error) {
-	secretKey := types.NamespacedName{
-		Name:      envstore.AppEnvSecretName(appName),
-		Namespace: envNs,
-	}
-
-	deleted := false
-	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		var secret corev1.Secret
-		if err := r.Client.Get(ctx, secretKey, &secret); err != nil {
-			if errors.IsNotFound(err) {
-				return nil
-			}
-			return err
-		}
-
-		existing := envstore.SecretToEnvs(&secret)
-		if len(existing) == 0 {
-			return nil
-		}
-		for _, env := range existing {
-			if env.Source != "binding" {
-				return nil
-			}
-		}
-
-		uid := secret.UID
-		resourceVersion := secret.ResourceVersion
-		if err := r.Client.Delete(ctx, &secret, client.Preconditions{
-			UID:             &uid,
-			ResourceVersion: &resourceVersion,
-		}); err != nil {
-			if errors.IsNotFound(err) {
-				return nil
-			}
-			return err
-		}
-		deleted = true
-		return nil
-	})
-	if err != nil {
-		return false, err
-	}
-	return deleted, nil
 }
 
 func (r *AppReconciler) readLastSpecEnv(ctx context.Context, ns, appName string) map[string]string {
@@ -3517,6 +3564,18 @@ func (e *resourceConflictError) Error() string {
 	return fmt.Sprintf("%s %q already exists in namespace %q and is not managed by Mortise; rename or delete it to let Mortise deploy this app", e.kind, e.name, e.namespace)
 }
 
+// envVarResolutionError reports a spec env var that cannot be resolved and
+// has never resolved before (no served value in the derived Secret to keep).
+// Terminal until the user fixes the Secret or the spec; envResourceError
+// translates it into a Failed EnvVarInvalid condition (CAI-943).
+type envVarResolutionError struct {
+	err error
+}
+
+func (e *envVarResolutionError) Error() string { return e.err.Error() }
+
+func (e *envVarResolutionError) Unwrap() error { return e.err }
+
 // conflictIfUnmanaged is the ownership guard for workload reconcile paths:
 // it returns a *resourceConflictError when obj is not Mortise-managed. Call
 // it both after the initial read AND inside the conflict-retry closure so a
@@ -3526,6 +3585,99 @@ func conflictIfUnmanaged(obj client.Object, kind string) error {
 		return nil
 	}
 	return &resourceConflictError{kind: kind, name: obj.GetName(), namespace: obj.GetNamespace()}
+}
+
+// ensureWebhookSteady runs the webhook ensure/verify pass for a git-source App
+// whose builds are all current, since the gate above prepareGitSource skips it
+// then. Failures degrade to the WebhookConfigured condition, never the App
+// phase: the workloads are serving, and flipping a Ready app to Failed over a
+// webhook check would be the status-vs-reality defect in the other direction.
+func (r *AppReconciler) ensureWebhookSteady(ctx context.Context, app *mortisev1alpha1.App) {
+	log := logf.FromContext(ctx)
+	if app.Spec.Source.ProviderRef == "" {
+		return
+	}
+	var gp mortisev1alpha1.GitProvider
+	if err := r.Get(ctx, types.NamespacedName{Name: app.Spec.Source.ProviderRef}, &gp); err != nil {
+		log.Error(err, "webhook verify: get GitProvider", "provider", app.Spec.Source.ProviderRef)
+		return
+	}
+	tokenResult, err := git.ResolveGitTokenForApp(ctx, r.Client, gp.Name, app.Namespace,
+		app.Annotations["mortise.dev/created-by"], app.Annotations["mortise.dev/git-token-owner"])
+	if err != nil {
+		if condErr := r.setWebhookCondition(ctx, app, metav1.ConditionFalse, webhookMissingTokenReason,
+			fmt.Sprintf("no valid git token found for any project member: %v", err)); condErr != nil {
+			log.Error(condErr, "failed to persist webhook condition")
+		}
+		return
+	}
+	if err := r.ensureWebhook(ctx, app, &gp, tokenResult.Token); err != nil {
+		log.Error(err, "webhook verification failed (non-fatal)")
+	}
+	r.reconcileRevisionSteady(ctx, app, &gp, tokenResult.Token)
+}
+
+// reconcileRevisionSteady re-resolves the branch HEAD for a builds-current git
+// app and re-stamps mortise.dev/revision when it is behind — exactly the write
+// the push webhook would have made. GitHub's push delivery is at-least-once in
+// practice, not in guarantee: one dropped event (never generated, per the
+// hook's own delivery log and the repo's public event stream) left an App
+// serving a stale revision indefinitely while reporting Ready, and the
+// rebuild-requested-at lever rebuilt the stale annotation rather than
+// recovering (CAI-1134). Runs on the webhook verify cadence, so a missed push
+// repairs within the hour. An App never stamped by a webhook is left alone:
+// its build identity is the branch name, and stamping a SHA would change the
+// identity rather than repair drift. Failures only log — the webhook stays
+// the trigger, this is its backstop, and the next cadence tick retries.
+func (r *AppReconciler) reconcileRevisionSteady(ctx context.Context, app *mortisev1alpha1.App, gp *mortisev1alpha1.GitProvider, token string) {
+	log := logf.FromContext(ctx)
+	current := app.Annotations["mortise.dev/revision"]
+	// Only a commit-SHA annotation is a webhook stamp that can go stale. A
+	// branch-name annotation means "track the branch": the build resolves it
+	// at clone time, so there is no drift to repair, and re-stamping it to a
+	// SHA would convert a tracking app into a pinned one and change its build
+	// identity. That churned every such app on each reconcile once the
+	// webhook condition was not True (webhookVerificationDue is true then),
+	// which the integration suite caught on the first PR after this shipped.
+	if !looksLikeCommitSHA(current) {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, git.HostTimeout)
+	defer cancel()
+	api, err := r.newGitAPI(gp, token, "")
+	if err != nil {
+		log.Error(err, "revision reconcile: create git API")
+		return
+	}
+	branch := firstNonEmpty(app.Spec.Source.Branch, "main")
+	head, err := api.ResolveBranchHead(ctx, app.Spec.Source.Repo, branch)
+	if err != nil {
+		log.Error(err, "revision reconcile: resolve branch head (non-fatal)", "branch", branch)
+		return
+	}
+	if head == "" || head == current {
+		return
+	}
+	log.Info("revision annotation is behind the branch head, re-stamping (missed push webhook)",
+		"branch", branch, "annotated", current, "head", head)
+	patch := []byte(fmt.Sprintf(`{"metadata":{"annotations":{"mortise.dev/revision":%q}}}`, head))
+	if err := r.Patch(ctx, app, client.RawPatch(types.MergePatchType, patch)); err != nil {
+		log.Error(err, "revision reconcile: patch revision annotation")
+	}
+}
+
+// looksLikeCommitSHA reports whether s is a full 40-hex git commit id, the
+// only form the webhook handler stamps.
+func looksLikeCommitSHA(s string) bool {
+	if len(s) != 40 {
+		return false
+	}
+	for _, c := range s {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 // ensureWebhook registers a webhook on the git repo if not already done.
@@ -3601,13 +3753,16 @@ func (r *AppReconciler) ensureWebhook(ctx context.Context, app *mortisev1alpha1.
 			if !strings.Contains(hook.URL, "/api/webhooks/") {
 				continue
 			}
-			if hook.URL == webhookURL {
+			if hook.URL == webhookURL && webhookEventsSufficient(hook.Events) {
 				if err := r.setWebhookCondition(ctx, app, metav1.ConditionTrue, webhookRegisteredReason, webhookInputHashMessage(inputHash, r.clock().Now())); err != nil {
 					log.Error(err, "failed to persist webhook condition")
 				}
 				return nil
 			}
-			// Stale Mortise webhook pointing at a different domain — remove it.
+			// Stale Mortise webhook pointing at a different domain, or one at
+			// the right URL with a deficient event set (a hand-registered
+			// push-only hook passes the URL match while PR previews silently
+			// never hear anything, CAI-793) — remove it and re-register.
 			if delErr := api.DeleteWebhook(ctx, app.Spec.Source.Repo, hook.ID); delErr != nil {
 				log.Error(delErr, "failed to delete stale webhook", "hookID", hook.ID, "url", hook.URL)
 			} else {
@@ -3653,6 +3808,21 @@ func webhookRegistrationInputHash(app *mortisev1alpha1.App, gp *mortisev1alpha1.
 		fmt.Fprintf(h, "json-error=%v\n", err)
 	}
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+// webhookEventsSufficient reports whether an existing hook subscribes to every
+// event Mortise registers. An empty list means the forge did not report events
+// — treat that as sufficient rather than churning delete/re-register on every
+// verify.
+func webhookEventsSufficient(events []string) bool {
+	if len(events) == 0 {
+		return true
+	}
+	have := make(map[string]bool, len(events))
+	for _, e := range events {
+		have[e] = true
+	}
+	return have["push"] && have["pull_request"]
 }
 
 func webhookInputHashMessage(hash string, verifiedAt time.Time) string {
@@ -4854,6 +5024,91 @@ func appProjectName(app *mortisev1alpha1.App) (string, error) {
 // wins on key conflict — that's how a team overrides Mortise's default
 // cluster-issuer without dropping to raw Kubernetes. Returns nil if both
 // inputs are empty so callers don't write an empty annotation map.
+// managedAnnotationsKey records, on the resource itself, which annotation keys
+// Mortise applied on its last pass, so a later pass can tell "no longer
+// desired, remove it" apart from "someone else's, leave it alone".
+const managedAnnotationsKey = "mortise.dev/managed-annotations"
+
+// mergeManagedAnnotations returns the annotations a managed resource should
+// carry after Mortise applies desired, touching only the keys Mortise manages.
+// Assigning desired over the whole map wiped every foreign annotation — on a
+// PVC that removed pv.kubernetes.io/bind-completed, which the PV controller
+// immediately restored, and the two controllers fought at ~40 writes/s forever
+// (mortise issue 631). Keys listed in the resource's bookkeeping annotation but
+// no longer desired are removed; every other existing key survives. The
+// returned bool reports whether anything would change, so callers can skip the
+// write entirely — a bound PVC with no desired annotations is never written
+// again.
+func mergeManagedAnnotations(existing, desired map[string]string) (map[string]string, bool) {
+	result := make(map[string]string, len(existing)+len(desired)+1)
+	for k, v := range existing {
+		result[k] = v
+	}
+	changed := false
+	for _, k := range strings.Split(existing[managedAnnotationsKey], ",") {
+		if k == "" || k == managedAnnotationsKey {
+			continue
+		}
+		if _, want := desired[k]; !want {
+			if _, present := result[k]; present {
+				delete(result, k)
+				changed = true
+			}
+		}
+	}
+	keys := make([]string, 0, len(desired))
+	for k, v := range desired {
+		if k == managedAnnotationsKey {
+			// The create path stamps the bookkeeping onto desired itself
+			// (stampManagedAnnotations); here it is recomputed, not copied.
+			continue
+		}
+		keys = append(keys, k)
+		if cur, ok := result[k]; !ok || cur != v {
+			result[k] = v
+			changed = true
+		}
+	}
+	sort.Strings(keys)
+	if book := strings.Join(keys, ","); book == "" {
+		if _, ok := result[managedAnnotationsKey]; ok {
+			delete(result, managedAnnotationsKey)
+			changed = true
+		}
+	} else if result[managedAnnotationsKey] != book {
+		result[managedAnnotationsKey] = book
+		changed = true
+	}
+	if len(result) == 0 {
+		return nil, changed
+	}
+	return result, changed
+}
+
+// stampManagedAnnotations adds the bookkeeping entry to a desired object's
+// annotations for the create path: updates go through
+// mergeManagedAnnotations, which stamps it itself, but a resource created
+// without the stamp would make its own keys read as foreign — and therefore
+// unremovable — on every later pass.
+func stampManagedAnnotations(annotations map[string]string) map[string]string {
+	if len(annotations) == 0 {
+		return annotations
+	}
+	keys := make([]string, 0, len(annotations))
+	for k := range annotations {
+		if k != managedAnnotationsKey {
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+	out := make(map[string]string, len(annotations)+1)
+	for k, v := range annotations {
+		out[k] = v
+	}
+	out[managedAnnotationsKey] = strings.Join(keys, ",")
+	return out
+}
+
 func mergeAnnotations(owned, user map[string]string) map[string]string {
 	if len(owned) == 0 && len(user) == 0 {
 		return nil
@@ -5234,7 +5489,7 @@ func (r *AppReconciler) reconcileExternalNameService(ctx context.Context, app *m
 			Name:        name,
 			Namespace:   envNs,
 			Labels:      appLabels(app, env.Name),
-			Annotations: mergeAnnotations(nil, env.Annotations),
+			Annotations: stampManagedAnnotations(mergeAnnotations(nil, env.Annotations)),
 		},
 		Spec: corev1.ServiceSpec{
 			Type:         corev1.ServiceTypeExternalName,
@@ -5270,7 +5525,7 @@ func (r *AppReconciler) reconcileExternalNameService(ctx context.Context, app *m
 		return r.Create(ctx, desired)
 	}
 
-	existing.Annotations = desired.Annotations
+	existing.Annotations, _ = mergeManagedAnnotations(existing.Annotations, desired.Annotations)
 	existing.Spec.ExternalName = desired.Spec.ExternalName
 	return r.Update(ctx, &existing)
 }
@@ -5481,6 +5736,37 @@ func (r *AppReconciler) appRequestsForBindingCredentialSecret(ctx context.Contex
 	return reqs
 }
 
+// appRequestsForProjectMember maps a ProjectMember to the git-source Apps of
+// its project. Git auth resolves tokens through the members in the App's own
+// (control) namespace, so an App that reconciled before the first member
+// existed latched GitAuthFailed and nothing re-looked: the valid token Secret
+// sat unread until an unrelated touch or the cache resync (CAI-960). Member
+// add, update, and delete all enqueue -- a removed member can also be the one
+// whose cached token an App is serving with.
+func (r *AppReconciler) appRequestsForProjectMember(ctx context.Context, obj client.Object) []reconcile.Request {
+	member, ok := obj.(*mortisev1alpha1.ProjectMember)
+	if !ok || member == nil || member.Namespace == "" {
+		return nil
+	}
+	var apps mortisev1alpha1.AppList
+	if err := r.List(ctx, &apps, client.InNamespace(member.Namespace)); err != nil {
+		logf.FromContext(ctx).Error(err, "listing Apps for a ProjectMember event",
+			"member", member.Namespace+"/"+member.Name)
+		return nil
+	}
+	var reqs []reconcile.Request
+	for i := range apps.Items {
+		if apps.Items[i].Spec.Source.Type != mortisev1alpha1.SourceTypeGit {
+			continue
+		}
+		reqs = append(reqs, reconcile.Request{NamespacedName: types.NamespacedName{
+			Name:      apps.Items[i].Name,
+			Namespace: apps.Items[i].Namespace,
+		}})
+	}
+	return reqs
+}
+
 // appRequestsForWebhookSecret maps a GitProvider's webhook HMAC Secret to
 // every App sourced from that provider. ensureWebhook folds the secret into
 // its registration input hash, so once the App reconciles the hook is
@@ -5625,6 +5911,7 @@ func (r *AppReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&networkingv1.Ingress{}, enqueueAppFromManagedResource).
 		Watches(&mortisev1alpha1.BuildRun{}, enqueueAppFromBuildRun).
 		Watches(&mortisev1alpha1.PreviewEnvironment{}, enqueueAppsFromPreviewEnvironment).
+		Watches(&mortisev1alpha1.ProjectMember{}, handler.EnqueueRequestsFromMapFunc(r.appRequestsForProjectMember)).
 		Named("app").
 		Complete(r)
 }
